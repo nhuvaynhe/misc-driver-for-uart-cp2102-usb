@@ -1,0 +1,1 @@
+savedcmd_/home/ngocdai/cp2102_device_driver/Module.symvers :=  scripts/mod/modpost -M        -o /home/ngocdai/cp2102_device_driver/Module.symvers -T /home/ngocdai/cp2102_device_driver/modules.order -i Module.symvers -e 

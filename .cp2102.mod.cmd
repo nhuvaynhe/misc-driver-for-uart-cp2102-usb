@@ -1,0 +1,1 @@
+savedcmd_/home/ngocdai/cp2102_device_driver/cp2102.mod := printf '%s\n'   cp2102.o | awk '!x[$$0]++ { print("/home/ngocdai/cp2102_device_driver/"$$0) }' > /home/ngocdai/cp2102_device_driver/cp2102.mod
