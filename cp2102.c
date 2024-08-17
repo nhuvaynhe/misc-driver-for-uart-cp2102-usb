@@ -1,5 +1,65 @@
 #include "cp2102.h"
 
+#define BBB_UART_REGSHIFT   2
+#define UART_BAUDRATE       115200
+
+static u32 uart_read(struct cp2102_serial *serial, u32 reg)
+{
+    return readl_relaxed(serial->regs +  (reg << BBB_UART_REGSHIFT));
+}
+
+static void uart_write(struct cp2102_serial *serial, u32 reg, u32 val)
+{
+    while ( !(uart_read(serial, UART_LSR) & UART_LSR_THRE) ) {
+        cpu_relax();
+    }
+
+    writel(val, serial->regs +  (reg << BBB_UART_REGSHIFT));
+}
+
+static void write_buffer(struct cp2102_serial *serial, char *buf)
+{
+    while (*buf != '\0')
+    {
+        uart_write(serial, UART_TX, *buf);
+        buf++;
+    }
+}
+
+//static void uart_software_reset(struct cp2102_serial *serial)
+//{
+    //uart_write(serial, UART_OMAP_SYSC, 0x01);
+    ///* waiting for the reset done */ 
+    //while ( !(uart_read(serial, UART_OMAP_SYSS) & 0x01) );
+//}
+
+static void bbb_uart_init(struct cp2102_serial *serial, unsigned int clock_freq)
+{
+    unsigned int baud_divisor = clock_freq / 16 / UART_BAUDRATE; 
+
+    /* disable UART to config baudrate */ 
+    uart_write(serial, UART_OMAP_MDR1, 0x7);
+    
+    /* swtich to register configuration mode B */ 
+    uart_write(serial, UART_LCR, 0x00);
+    uart_write(serial, UART_LCR, 0x80);
+
+    /* config baudrate */ 
+    uart_write(serial, UART_DLL, (baud_divisor & 0xFF));
+    uart_write(serial, UART_DLM, (baud_divisor >> 8) & 0xFF);
+
+    /* set word length to 8 bit */ 
+    uart_write(serial, UART_LCR, UART_LCR_WLEN8);
+
+    /* enable UART 16x mode*/ 
+    uart_write(serial, UART_OMAP_MDR1, 0x00);
+
+    /* reset FIFO */
+    uart_write(serial, UART_FCR, UART_FCR_CLEAR_XMIT | UART_FCR_CLEAR_RCVR);
+}
+
+
+
 /*
  * File operations function
  */
@@ -23,9 +83,6 @@ static int cp2102_misc_write(struct file *f, const char __user *buf,
     return len;
 }
 
-/*
- * Misc Device Driver struct init
- */
 
 static int cp2102_misc_read(struct file *f, char __user *buf,
                             size_t len, loff_t *ppos)
@@ -34,6 +91,9 @@ static int cp2102_misc_read(struct file *f, char __user *buf,
     return 0;
 }
 
+/*
+ * Misc Device Driver struct init
+ */
 
 static const struct file_operations fops = {
     .owner   =  THIS_MODULE,
@@ -60,7 +120,9 @@ static struct platform_driver cp2102_platform_driver = {
 static int cp2102_platform_device_probe(struct platform_device *pdev)
 {
     pr_info("cp2102_platform_device_probe.\n");
+
     int ret;
+    unsigned int clock_freq;
     
     struct cp2102_serial *serial;
     serial = devm_kzalloc(&pdev->dev, sizeof(*serial), GFP_KERNEL);
@@ -87,6 +149,16 @@ static int cp2102_platform_device_probe(struct platform_device *pdev)
     if (IS_ERR(serial->regs))
         return PTR_ERR(serial->regs);
 
+    /* initialize uart */ 
+    ret = of_property_read_u32(pdev->dev.of_node, "clock-frequency",
+                                    &clock_freq);
+    if (ret) {
+        dev_err(&pdev->dev,
+                    "clock-frequency property not found in Device Tree\n");
+    }
+
+    bbb_uart_init(serial, clock_freq);
+
     /* specific name for the device in devtmpfs */ 
     serial->miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "cp2102-%x", serial->res->start);
     if (!serial->miscdev.name)
@@ -102,7 +174,9 @@ static int cp2102_platform_device_probe(struct platform_device *pdev)
         dev_err(&pdev->dev, "failed to register miscdev %d.\n", ret);
         return ret;
     }
-        
+    
+    write_buffer(serial, "Hello from NgocDai");
+
     return 0;
 }
 
