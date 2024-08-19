@@ -1,7 +1,12 @@
 #include "cp2102.h"
+#include <linux/serial_reg.h>
 
 #define BBB_UART_REGSHIFT   2
 #define UART_BAUDRATE       115200
+
+/*
+ * Read/write function
+ */
 
 static u32 uart_read(struct cp2102_serial *serial, u32 reg)
 {
@@ -17,21 +22,57 @@ static void uart_write(struct cp2102_serial *serial, u32 reg, u32 val)
     writel(val, serial->regs +  (reg << BBB_UART_REGSHIFT));
 }
 
-static void write_buffer(struct cp2102_serial *serial, char *buf)
+static void uart_str_write(struct cp2102_serial *serial, char *buf)
 {
     while (*buf != '\0')
     {
         uart_write(serial, UART_TX, *buf);
+        if (*buf == '\n')
+            uart_write(serial, UART_TX, '\r');
         buf++;
     }
 }
 
-//static void uart_software_reset(struct cp2102_serial *serial)
-//{
-    //uart_write(serial, UART_OMAP_SYSC, 0x01);
-    ///* waiting for the reset done */ 
-    //while ( !(uart_read(serial, UART_OMAP_SYSS) & 0x01) );
-//}
+int circ_buf_isempty(struct cp2102_serial *serial)
+{
+    return serial->buf_head == serial->buf_tail;
+}
+
+
+/*
+ * Interrupt request function
+ */
+
+static irqreturn_t cp2102_misc_isr(int irq, void *serial_id)
+{
+    int ret;
+    unsigned long flags;
+    struct cp2102_serial *serial = serial_id;
+
+    if (uart_read(serial, UART_LSR) & UART_LSR_DR) {
+        char msg = uart_read(serial, UART_RX);
+
+        spin_lock_irqsave(&serial->lock, flags);
+
+        serial->circ_buf[serial->buf_head] = msg;
+
+        serial->buf_head++;
+        if (serial->buf_head >= BUF_SIZE)
+            serial->buf_head = 0;
+
+        spin_unlock_irqrestore(&serial->lock, flags);
+
+        wake_up(&serial->tty_wait);
+
+        ret = IRQ_HANDLED;
+    } else {
+        pr_err("there is no new character in the RX FIFO.\n");
+        ret = IRQ_NONE;
+    }
+
+    return ret;
+}
+
 
 static void bbb_uart_init(struct cp2102_serial *serial, unsigned int clock_freq)
 {
@@ -42,7 +83,7 @@ static void bbb_uart_init(struct cp2102_serial *serial, unsigned int clock_freq)
     
     /* swtich to register configuration mode B */ 
     uart_write(serial, UART_LCR, 0x00);
-    uart_write(serial, UART_LCR, 0x80);
+    uart_write(serial, UART_LCR, UART_LCR_DLAB);
 
     /* config baudrate */ 
     uart_write(serial, UART_DLL, (baud_divisor & 0xFF));
@@ -54,11 +95,14 @@ static void bbb_uart_init(struct cp2102_serial *serial, unsigned int clock_freq)
     /* enable UART 16x mode*/ 
     uart_write(serial, UART_OMAP_MDR1, 0x00);
 
+    /* initialize interrupt */
+    uart_write(serial, UART_IER, UART_IER_RDI);
+
     /* reset FIFO */
     uart_write(serial, UART_FCR, UART_FCR_CLEAR_XMIT | UART_FCR_CLEAR_RCVR);
+
+    uart_str_write(serial, "Hello World, config done.!\n");
 }
-
-
 
 /*
  * File operations function
@@ -76,19 +120,53 @@ static int cp2102_misc_close(struct inode *inode, struct file *file)
     return 0;
 }
 
-static int cp2102_misc_write(struct file *f, const char __user *buf,
-                            size_t len, loff_t *ppos)
+static ssize_t cp2102_misc_write(struct file *file, const char __user *buf,
+                            size_t count, loff_t *offset)
 {
-    pr_info("CP2102 misc device write\n");
+    struct miscdevice *miscdev_ptr = file->private_data;
+    struct platform_device *pdev = to_platform_device(miscdev_ptr->parent);
+    struct cp2102_serial *serial = platform_get_drvdata(pdev);
+
+    ssize_t len;
+
+    /* get amount of data to copy */ 
+    len = min(count, (size_t) (BUF_SIZE - *offset));
+
+    /* copy data to user */ 
+    if (copy_from_user(serial->tx_buffer + *offset, buf, len))
+        return -EFAULT;
+
+    uart_str_write(serial, serial->tx_buffer);
+
+    *offset += len;
     return len;
 }
 
 
-static int cp2102_misc_read(struct file *f, char __user *buf,
-                            size_t len, loff_t *ppos)
+static ssize_t cp2102_misc_read(struct file *file, char __user *buf,
+                            size_t count, loff_t *offset)
 {
-    pr_info("CP2102 misc device read\n");
-    return 0;
+    struct miscdevice *miscdev_ptr = file->private_data;
+    struct platform_device *pdev = to_platform_device(miscdev_ptr->parent);
+    struct cp2102_serial *serial = platform_get_drvdata(pdev);
+
+    spin_lock_irq(&serial->tty_wait.lock); /* disable irq */ 
+
+    wait_event_interruptible_locked_irq(serial->tty_wait, !circ_buf_isempty(serial));
+
+    size_t len = min(count, (size_t) (BUF_SIZE - *offset));
+
+    if (copy_to_user(buf, &serial->circ_buf[serial->buf_tail], len)) {
+        return -EFAULT;
+    }
+
+    serial->buf_tail = (serial->buf_tail + (unsigned int) len) % BUF_SIZE;
+    *offset += len;
+
+    // Release lock
+    spin_unlock_irq(&serial->tty_wait.lock); /* enable irq */ 
+
+    return len;
 }
 
 /*
@@ -105,7 +183,7 @@ static const struct file_operations fops = {
 
 static struct platform_driver cp2102_platform_driver = {
     .driver    = {
-        .name  = "cp2102_platform_device",
+        .name  = "cp2102",
         .of_match_table = of_uart_platform_device_match,
         .owner = THIS_MODULE,
     },
@@ -165,7 +243,7 @@ static int cp2102_platform_device_probe(struct platform_device *pdev)
         return -ENOMEM;
 
     serial->miscdev.minor  = MISC_DYNAMIC_MINOR,
-    serial->miscdev.fops = &fops;
+    serial->miscdev.fops   = &fops;
     serial->miscdev.parent = &pdev->dev;
 
     /* register a single misc device */ 
@@ -174,8 +252,22 @@ static int cp2102_platform_device_probe(struct platform_device *pdev)
         dev_err(&pdev->dev, "failed to register miscdev %d.\n", ret);
         return ret;
     }
-    
-    write_buffer(serial, "Hello from NgocDai");
+
+    /* request interrupt service */ 
+    serial->irq = platform_get_irq(pdev, 0);
+    if (serial->irq < 0)
+        return -ENXIO;
+    pr_info("we get irq number: %d.\n", serial->irq);
+
+    ret = devm_request_irq(&pdev->dev, serial->irq, cp2102_misc_isr,
+                            0, pdev->name, (void *) serial); // no flags
+    if (ret) {
+        dev_err(&pdev->dev, "failed to request interrupt %d.\n", ret);
+        misc_deregister(&serial->miscdev);
+        return ret;
+    }
+
+    init_waitqueue_head(&serial->tty_wait);
 
     return 0;
 }
