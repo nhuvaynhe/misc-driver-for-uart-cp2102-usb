@@ -15,6 +15,9 @@
 
 #define BUF_SIZE    16
 
+#define SERIAL_RESET_COUNTER    0
+#define SERIAL_GET_COUNTER      1
+
 struct cp2102_serial {
     void __iomem *regs;
     struct miscdevice miscdev;
@@ -27,6 +30,7 @@ struct cp2102_serial {
     unsigned int buf_head;
     spinlock_t lock;
     wait_queue_head_t tty_wait;
+    unsigned int num_of_chars;
 };
 
 static const struct of_device_id of_uart_platform_device_match[] = {

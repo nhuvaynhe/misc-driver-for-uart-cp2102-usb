@@ -169,6 +169,31 @@ static ssize_t cp2102_misc_read(struct file *file, char __user *buf,
     return len;
 }
 
+static long cp2102_misc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct miscdevice *miscdev_ptr = file->private_data;
+    struct platform_device *pdev = to_platform_device(miscdev_ptr->parent);
+    struct cp2102_serial *serial = platform_get_drvdata(pdev);
+
+    unsigned int *counter = &serial->num_of_chars;
+    void __user *argp = (void __user *)arg;
+
+    switch (cmd) {
+    case SERIAL_GET_COUNTER:
+        if (copy_to_user(argp, (void *)counter, sizeof(*counter)))
+            return -EFAULT;
+
+        break;
+    case SERIAL_RESET_COUNTER:
+        *counter = 0;
+        break;
+    default:
+        return -ENOTTY;
+    }
+
+    return 0;
+}
+
 /*
  * Misc Device Driver struct init
  */
@@ -179,6 +204,7 @@ static const struct file_operations fops = {
     .read    =  cp2102_misc_read,
     .open    =  cp2102_misc_open,
     .release =  cp2102_misc_close,
+    .unlocked_ioctl = cp2102_misc_ioctl,
 };
 
 static struct platform_driver cp2102_platform_driver = {
